@@ -1,3 +1,5 @@
+from datetime import datetime
+import time
 from datasets import load_from_disk
 import tiktoken
 from torch.utils.data import DataLoader
@@ -12,6 +14,9 @@ EOS_IDX = 50257
 PAD_IDX = 50258
 
 BLOCK_SIZE = 256
+BATCH_SIZE = 200
+STEP_NUM = 100000
+
 
 @dataclass
 class TransformerConfig:
@@ -55,9 +60,6 @@ class Attention(nn.Module):
 class CausalAttention(Attention):
     def __init__(self, config: TransformerConfig):
         super().__init__(config)
-
-        self.register_buffer('bias', torch.tril(torch.ones(
-            config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
         B, T, C = x.size()
@@ -184,13 +186,29 @@ class Transformer(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
         self.dropout = nn.Dropout(config.p_drop)
 
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weight)
+
+    def _init_weight(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            # if hasattr(module, 'SCALE_INIT'):
+            #     std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, src_idx, idx, target_idx=None):
         B, T = idx.size()
         src_B, S = src_idx.size()
         assert B == src_B, f"src batch size {src_B} must match target batch size {B}"
 
         pos = torch.arange(0, T, 1, dtype=torch.long, device=idx.device)
-        src_pos = torch.arange(0, S, 1, dtype=torch.long, device=src_idx.device)
+        src_pos = torch.arange(0, S, 1, dtype=torch.long,
+                               device=src_idx.device)
         pos_embd = self.transformer.wpe(pos)
         src_pos_embd = self.transformer.wpe(src_pos)
         tok_embd = self.transformer.wte(idx)
@@ -270,13 +288,36 @@ class DataLoaderLite:
         self.curr_pos += B
         return src_idx, idx[:, :-1], idx[:, 1:]
 
+
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
+torch.set_float32_matmul_precision('high')
 
-train_loader = DataLoaderLite(16, BLOCK_SIZE)
+device = 'cuda:3'
+
+train_loader = DataLoaderLite(BATCH_SIZE, BLOCK_SIZE)
 model = Transformer(TransformerConfig())
+model.to(device)
 
-src_idx, idx, target_idx = train_loader.next_batch()
-logits, loss = model(src_idx, idx, target_idx)
 
-print(f'loss {loss:.2f}')
+optimizer = torch.optim.AdamW(model.parameters(), betas=(0.9, 0.98), eps=1e-9)
+for _ in range(STEP_NUM):
+    t0 = time.time()
+
+    src_idx, idx, target_idx = train_loader.next_batch()
+    src_idx, idx, target_idx = src_idx.to(
+        device), idx.to(device), target_idx.to(device)
+
+    optimizer.zero_grad()
+    with torch.autocast(device, dtype=torch.bfloat16):
+        logits, loss = model(src_idx, idx, target_idx)
+
+    loss.backward()
+    optimizer.step()
+
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000
+    print(f'loss {loss:.2f} dt {dt:.2f}')
+
+torch.save(model.state_dict(), f'./{datetime.now().strftime("%Y%m%d_%H%M")}.model')

@@ -219,3 +219,4 @@ __marimo__/
 
 # datasets
 /transformer/my_wmt14_tokens
+*.model
