@@ -1,4 +1,5 @@
 from datetime import datetime
+from pathlib import Path
 import time
 from datasets import load_from_disk
 import tiktoken
@@ -16,6 +17,7 @@ PAD_IDX = 50258
 BLOCK_SIZE = 256
 BATCH_SIZE = 200
 STEP_NUM = 100000
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 @dataclass
@@ -251,11 +253,12 @@ enc = tiktoken.Encoding(
 
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, dataset_path=None):
         self.B = B
         self.T = T
 
-        self.ds = load_from_disk('./my_wmt14_tokens')
+        dataset_path = Path(dataset_path) if dataset_path else SCRIPT_DIR / 'my_wmt14_tokens'
+        self.ds = load_from_disk(str(dataset_path))
         self.length = len(self.ds)
 
         self.curr_pos = 0
@@ -288,36 +291,42 @@ class DataLoaderLite:
         self.curr_pos += B
         return src_idx, idx[:, :-1], idx[:, 1:]
 
+def main():
 
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-torch.set_float32_matmul_precision('high')
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    torch.set_float32_matmul_precision('high')
 
-device = 'cuda:3'
+    device = 'cuda:3'
 
-train_loader = DataLoaderLite(BATCH_SIZE, BLOCK_SIZE)
-model = Transformer(TransformerConfig())
-model.to(device)
+    train_loader = DataLoaderLite(BATCH_SIZE, BLOCK_SIZE)
+    model = Transformer(TransformerConfig())
+    model.to(device)
 
 
-optimizer = torch.optim.AdamW(model.parameters(), betas=(0.9, 0.98), eps=1e-9)
-for _ in range(STEP_NUM):
-    t0 = time.time()
+    optimizer = torch.optim.AdamW(model.parameters(), betas=(0.9, 0.98), eps=1e-9)
+    for _ in range(STEP_NUM):
+        t0 = time.time()
 
-    src_idx, idx, target_idx = train_loader.next_batch()
-    src_idx, idx, target_idx = src_idx.to(
-        device), idx.to(device), target_idx.to(device)
+        src_idx, idx, target_idx = train_loader.next_batch()
+        src_idx, idx, target_idx = src_idx.to(
+            device), idx.to(device), target_idx.to(device)
 
-    optimizer.zero_grad()
-    with torch.autocast(device, dtype=torch.bfloat16):
-        logits, loss = model(src_idx, idx, target_idx)
+        optimizer.zero_grad()
+        with torch.autocast(device, dtype=torch.bfloat16):
+            logits, loss = model(src_idx, idx, target_idx)
 
-    loss.backward()
-    optimizer.step()
+        loss.backward()
+        optimizer.step()
 
-    torch.cuda.synchronize()
-    t1 = time.time()
-    dt = (t1 - t0) * 1000
-    print(f'loss {loss:.2f} dt {dt:.2f}')
+        torch.cuda.synchronize()
+        t1 = time.time()
+        dt = (t1 - t0) * 1000
+        print(f'loss {loss:.2f} dt {dt:.2f}')
 
-torch.save(model.state_dict(), f'./{datetime.now().strftime("%Y%m%d_%H%M")}.model')
+    model_path = SCRIPT_DIR / f'{datetime.now().strftime("%Y%m%d_%H%M")}.model'
+    torch.save(model.state_dict(), model_path)
+
+
+if __name__ == '__main__':
+    main()
