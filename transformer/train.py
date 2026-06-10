@@ -41,7 +41,7 @@ class Attention(nn.Module):
         B, T, C = x.size()
 
         qkv = self.c_attn(x)  # (B, T, 3 * C)
-        q, k, v = torch.split(qkv, 3)
+        q, k, v = qkv.split(C, dim=2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
@@ -63,13 +63,12 @@ class CausalAttention(Attention):
         B, T, C = x.size()
 
         qkv = self.c_attn(x)  # (B, T, 3 * C)
-        q, k, v = torch.split(qkv, 3)
+        q, k, v = qkv.split(C, dim=2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        output = F.scaled_dot_product_attention(
-            q, k, v, self.bias, is_causal=True)
+        output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         output = output.transpose(1, 2).contiguous().view(B, T, C)
         output = self.c_proj(output)
         return output
@@ -91,13 +90,14 @@ class CrossAttention(nn.Module):
 
     def forward(self, x, y):
         B, T, C = x.size()
+        _, S, _ = y.size()
 
-        v = self.c_attn_x(x)  # (B, T, C)
-        qk = self.c_attn_y(y)  # (B, T, 2 * C)
-        q, k = torch.split(qk, 2)
+        q = self.c_attn_x(x)  # (B, T, C)
+        kv = self.c_attn_y(y)  # (B, S, 2 * C)
+        k, v = kv.split(C, dim=2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        k = k.view(B, S, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, S, self.n_head, C // self.n_head).transpose(1, 2)
 
         output = F.scaled_dot_product_attention(q, k, v)
         output = output.transpose(1, 2).contiguous().view(B, T, C)
@@ -173,8 +173,8 @@ class Transformer(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wpe=nn.Embedding(config.vocab_size, config.n_embd),
-            wte=nn.Embedding(config.block_size, config.n_embd),
+            wte=nn.Embedding(config.vocab_size, config.n_embd),
+            wpe=nn.Embedding(config.block_size, config.n_embd),
             h_enc=nn.ModuleList([EncoderBlock(config)
                                 for _ in range(config.n_layer)]),
             h_dec=nn.ModuleList([DecoderBlock(config)
@@ -186,26 +186,35 @@ class Transformer(nn.Module):
 
     def forward(self, src_idx, idx, target_idx=None):
         B, T = idx.size()
+        src_B, S = src_idx.size()
+        assert B == src_B, f"src batch size {src_B} must match target batch size {B}"
 
         pos = torch.arange(0, T, 1, dtype=torch.long, device=idx.device)
+        src_pos = torch.arange(0, S, 1, dtype=torch.long, device=src_idx.device)
         pos_embd = self.transformer.wpe(pos)
+        src_pos_embd = self.transformer.wpe(src_pos)
         tok_embd = self.transformer.wte(idx)
         src_tok_embd = self.transformer.wte(src_idx)
 
         x = pos_embd + tok_embd
         x = self.dropout(x)
 
-        src_y = pos_embd + src_tok_embd
+        src_y = src_pos_embd + src_tok_embd
         src_y = self.dropout(src_y)
 
-        src_y = self.transformer.h_enc(src_y)
-        x = self.transformer.h_dec(x, src_y)
+        for block in self.transformer.h_enc:
+            src_y = block(src_y)
+        for block in self.transformer.h_dec:
+            x = block(x, src_y)
 
         logits = self.lm_head(x)
         loss = None
         if target_idx is not None:
             loss = F.cross_entropy(
-                logits, target_idx, ignore_index=PAD_IDX, label_smoothing=self.config.eps_ls)
+                logits.view(-1, logits.size(-1)),
+                target_idx.reshape(-1),
+                ignore_index=PAD_IDX,
+                label_smoothing=self.config.eps_ls)
 
         return logits, loss
 
@@ -246,11 +255,11 @@ class DataLoaderLite:
         idx = self.ds['en'][self.curr_pos:self.curr_pos + B]
 
         for i in range(B):
-            src_idx[i] += [EOS_IDX]
+            src_idx[i] = src_idx[i][:T - 1] + [EOS_IDX]
             if len(src_idx[i]) < T:
                 src_idx[i] += [PAD_IDX] * (T - len(src_idx[i]))
 
-            idx[i] += [EOS_IDX]
+            idx[i] = idx[i][:T - 1] + [EOS_IDX]
             if len(idx[i]) < T:
                 idx[i] += [PAD_IDX] * (T - len(idx[i]))
             idx[i] = [BOS_IDX] + idx[i]
@@ -258,6 +267,7 @@ class DataLoaderLite:
         src_idx = torch.tensor(src_idx).view(B, T)
         idx = torch.tensor(idx).view(B, T + 1)
 
+        self.curr_pos += B
         return src_idx, idx[:, :-1], idx[:, 1:]
 
 torch.manual_seed(42)
@@ -270,4 +280,3 @@ src_idx, idx, target_idx = train_loader.next_batch()
 logits, loss = model(src_idx, idx, target_idx)
 
 print(f'loss {loss:.2f}')
-
